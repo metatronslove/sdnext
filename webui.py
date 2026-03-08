@@ -237,6 +237,15 @@ def get_remote_ip():
 
 def start_common():
     log.debug('Entering start sequence')
+    try:
+        gpu_count = modules.devices.get_device_count()
+        if gpu_count >= 2:  # En az 2 GPU varsa paralel modu aktifleştir
+            modules.devices.enable_parallel_gpus()
+            log.info(f"🎮 {gpu_count} GPU paralel mod aktif!")
+        else:
+            log.info(f"🎮 {gpu_count} GPU tespit edildi, tek GPU modunda çalışılıyor")
+    except Exception as e:
+        log.debug(f"Paralel GPU başlatılamadı: {e}")
     if shared.cmd_opts.data_dir is not None and len(shared.cmd_opts.data_dir) > 0:
         log.info(f'Base path: data="{shared.cmd_opts.data_dir}"')
     if shared.cmd_opts.models_dir is not None and len(shared.cmd_opts.models_dir) > 0 and shared.cmd_opts.models_dir != 'models':
@@ -381,6 +390,13 @@ def webui(restart=False):
     modules.sd_models.write_metadata()
 
     load_model()
+    try:
+        if modules.devices.is_parallel_enabled() and shared.sd_model is not None:
+            modules.devices.parallelize_unet(shared.sd_model)
+            log.info("Model UNet/VAE paralel moda geçirildi")
+    except Exception as e:
+        log.debug(f"Model paralelleştirme hatası: {e}")
+    
     mount_subpath(app)
     shared.opts.save()
 

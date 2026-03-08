@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SD.Next: Multi-GPU Parallel Processing</title>
+    <style>
+        /* SD.Next docs inspired styling */
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            color: #e0e0e0;
+            background-color: #1e1e2f;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem;
+        }
+        h1, h2, h3 {
+            font-weight: 500;
+            color: #ffffff;
+            border-bottom: 1px solid #33334e;
+            padding-bottom: 0.3rem;
+        }
+        h1 {
+            font-size: 2.2rem;
+            border-bottom: 2px solid #4a6fa5;
+        }
+        h2 {
+            font-size: 1.8rem;
+            margin-top: 2rem;
+        }
+        h3 {
+            font-size: 1.4rem;
+            border-bottom: none;
+        }
+        a {
+            color: #7aa2f7;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        p, li {
+            color: #c0c0d0;
+        }
+        code {
+            background-color: #2a2a3c;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', monospace;
+            font-size: 0.9em;
+            color: #d4bfff;
+        }
+        pre {
+            background-color: #2a2a3c;
+            padding: 1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            border: 1px solid #3a3a55;
+        }
+        pre code {
+            background: none;
+            padding: 0;
+            color: #e0e0e0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+        }
+        th {
+            background-color: #2d2d44;
+            color: #ffffff;
+            font-weight: 600;
+            text-align: left;
+            padding: 0.75rem;
+            border: 1px solid #3a3a5a;
+        }
+        td {
+            padding: 0.75rem;
+            border: 1px solid #3a3a5a;
+            color: #c0c0d0;
+        }
+        tr:nth-child(even) {
+            background-color: #26263b;
+        }
+        .tip, .note, .warning {
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin: 1.5rem 0;
+            border-left: 6px solid;
+        }
+        .tip {
+            background-color: #1e3a3a;
+            border-left-color: #2ecc71;
+        }
+        .note {
+            background-color: #2d3047;
+            border-left-color: #7aa2f7;
+        }
+        .warning {
+            background-color: #4a2e2e;
+            border-left-color: #e06c75;
+        }
+        .tip strong, .note strong, .warning strong {
+            color: #ffffff;
+        }
+        hr {
+            border: none;
+            border-top: 1px solid #33334e;
+            margin: 2rem 0;
+        }
+        .footer {
+            margin-top: 3rem;
+            text-align: center;
+            color: #8888a0;
+            font-size: 0.9rem;
+        }
+    </style>
+    <script data-name="BMC-Widget" 
+        data-cfasync="false" 
+        src="https://cdnjs.buymeacoffee.com/1.0.0/widget.prod.min.js" 
+        data-id="metatronslove" 
+        data-description="Support me on Buy me a coffee!" 
+        data-message="Do we like my modifications ? I like coffee" 
+        data-color="#FFDD00" 
+        data-position="right" 
+        data-x_margin="18" 
+        data-y_margin="18">
+	</script>
+</head>
+<body>
+    <div class="container">
+        <h1>Multi-GPU Parallel Processing in SD.Next</h1>
+        <p>This document describes the modifications made to enable parallel GPU processing across multiple graphics cards in SD.Next. These changes allow you to utilize all available GPUs as a single logical unit, combining their VRAM and processing power for generating high-resolution images.</p>
+
+        <div class="tip">
+            <strong>💡 Tip</strong><br>
+            If you run into issues, check out the official <a href="https://vladmandic.github.io/sdnext-docs/FAQ/">FAQ</a> as well as <a href="https://vladmandic.github.io/sdnext-docs/Debug/">Troubleshooting and Debugging guides</a>.
+        </div>
+
+        <h2>Overview</h2>
+        <p>The modifications enhance SD.Next's device management to support <strong>data parallelism</strong> using PyTorch's <code>DataParallel</code>. When enabled, models (particularly UNet and VAE) are automatically distributed across all available GPUs. This approach:</p>
+        <ul>
+            <li>Combines total VRAM of all GPUs, enabling generation of much larger images than any single card could handle.</li>
+            <li>Splits the computational workload (batches/tensors) across GPUs, potentially increasing processing speed.</li>
+            <li>Works seamlessly with the existing SD.Next codebase without altering the behavior of original functions.</li>
+        </ul>
+
+        <hr>
+
+        <h2>Modified Files & Key Changes</h2>
+
+        <h3>1. <code>modules/devices.py</code> Additions</h3>
+        <p>The following functions and variables were added to the end of the file, preserving all original functions:</p>
+
+        <h4>New Global Variables</h4>
+        <pre><code>_parallel_enabled = False          # Tracks if parallel mode is active
+_parallel_device_ids = []           # List of GPU IDs being used
+_parallel_models = {}               # Stores wrapped parallel models</code></pre>
+
+        <h4>Core Control Functions</h4>
+        <table>
+            <thead>
+                <tr><th>Function</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>enable_parallel_gpus(device_ids=None)</code></td><td>Activates parallel mode. If <code>device_ids</code> is <code>None</code>, it uses all detected GPUs. Returns <code>True</code> on success.</td></tr>
+                <tr><td><code>disable_parallel_gpus()</code></td><td>Deactivates parallel mode and clears GPU memory.</td></tr>
+                <tr><td><code>is_parallel_enabled()</code></td><td>Returns the current status of parallel mode.</td></tr>
+                <tr><td><code>get_parallel_device_ids()</code></td><td>Returns the list of GPU IDs currently used in parallel.</td></tr>
+            </tbody>
+        </table>
+
+        <h4>Model Parallelization</h4>
+        <table>
+            <thead>
+                <tr><th>Function</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>parallelize_model(model, model_name="default", device_ids=None)</code></td><td>Wraps a given PyTorch model (<code>torch.nn.Module</code>) with <code>DataParallel</code>, distributing it across the specified (or all) GPUs.</td></tr>
+                <tr><td><code>parallelize_unet(sd_model)</code></td><td>Specifically targets a loaded Stable Diffusion model, automatically parallelizing its UNet and VAE components.</td></tr>
+            </tbody>
+        </table>
+
+        <h4>Extended Original Functions</h4>
+        <ul>
+            <li><strong><code>torch_gc</code></strong>: The original garbage collection function was extended to also clear cache on all parallel GPUs.</li>
+            <li><strong><code>autocast</code></strong>: The original autocast context was extended to work correctly with the primary GPU in parallel mode.</li>
+        </ul>
+
+        <h3>2. <code>webui.py</code> Integration</h3>
+        <p>Two key sections were added to the main launch script to automate the process:</p>
+
+        <h4>A. Automatic Activation on Startup</h4>
+        <p>Inside the <code>start_common()</code> function, we added a block that detects available GPUs and enables parallel mode if <strong>two or more</strong> are found:</p>
+        <pre><code>def start_common():
+    log.debug('Entering start sequence')
+    
+    # === AUTO-ENABLE PARALLEL GPUS ===
+    try:
+        gpu_count = modules.devices.get_device_count()
+        if gpu_count >= 2:
+            modules.devices.enable_parallel_gpus()
+            log.info(f"🎮 {gpu_count} GPU parallel mode active!")
+        else:
+            log.info(f"🎮 {gpu_count} GPU(s) detected, running in single-GPU mode")
+    except Exception as e:
+        log.debug(f"Parallel GPU initialization failed: {e}")
+    # === END OF PARALLEL GPU SETUP ===
+    
+    # ... rest of the original function ...</code></pre>
+        <div class="note">
+            <strong>📝 Note</strong>: The threshold is set to <code>>=2</code> GPUs. If you have 5, all will be used.
+        </div>
+
+        <h4>B. Model Parallelization After Loading</h4>
+        <p>After the model is loaded in the <code>webui()</code> function, we automatically parallelize its core components:</p>
+        <pre><code>def webui(restart=False):
+    # ... existing code ...
+    load_model()
+    
+    # === PARALLELIZE LOADED MODEL ===
+    try:
+        if modules.devices.is_parallel_enabled() and shared.sd_model is not None:
+            modules.devices.parallelize_unet(shared.sd_model)
+            log.info("Model UNet/VAE converted to parallel mode")
+    except Exception as e:
+        log.debug(f"Model parallelization error: {e}")
+    # === END OF MODEL PARALLELIZATION ===
+    
+    # ... rest of the original function ...</code></pre>
+
+        <hr>
+
+        <h2>How It Works Technically</h2>
+        <ol>
+            <li><strong>Detection</strong>: During SD.Next startup, <code>get_device_count()</code> queries PyTorch for the number of available CUDA GPUs.</li>
+            <li><strong>Activation</strong>: If the count meets the threshold, <code>enable_parallel_gpus()</code> is called. This function:
+                <ul>
+                    <li>Stores the list of GPU IDs.</li>
+                    <li>Performs an initial cache cleanup on each GPU.</li>
+                    <li>Logs the name and VRAM of each detected GPU.</li>
+                </ul>
+            </li>
+            <li><strong>Model Wrapping</strong>: When a model is loaded (e.g., a Stable Diffusion checkpoint), <code>parallelize_unet(sd_model)</code> is invoked. It:
+                <ul>
+                    <li>Extracts the UNet and VAE submodules.</li>
+                    <li>Moves them to the primary GPU (the first one in the list).</li>
+                    <li>Wraps them with <code>torch.nn.DataParallel</code>, which handles splitting the input data across GPUs and gathering the results.</li>
+                </ul>
+            </li>
+            <li><strong>Inference</strong>: During image generation, the wrapped UNet automatically distributes its workload. PyTorch handles the communication and synchronization between GPUs.</li>
+            <li><strong>Memory Management</strong>: The modified <code>torch_gc</code> function ensures that when garbage collection is triggered (e.g., after generation), it clears VRAM on <strong>all</strong> parallel GPUs, preventing memory fragmentation.</li>
+        </ol>
+
+        <hr>
+
+        <h2>Benefits & Expected Outcomes</h2>
+        <ul>
+            <li><strong>Higher Resolution Generation</strong>: By combining VRAM, you can generate images with resolutions that would normally cause out-of-memory errors on a single GPU. For example, with 5x 8GB GPUs, you have effectively 40GB of VRAM for processing.</li>
+            <li><strong>Potentially Faster Processing</strong>: For large batch sizes, the workload is split, which can reduce overall generation time. The speedup depends on the PCIe bandwidth between GPUs and the specific model architecture.</li>
+            <li><strong>Seamless Integration</strong>: No changes are required to any UI elements, scripts, or other modules. The parallelization happens automatically behind the scenes.</li>
+        </ul>
+
+        <hr>
+
+        <h2>Important Considerations</h2>
+        <div class="warning">
+            <strong>⚠️ VRAM Usage</strong>: While total available memory increases, the model itself is replicated on each GPU. The memory saving comes from being able to process larger tensors (like bigger latent images) that are split across cards.
+        </div>
+        <div class="warning">
+            <strong>⚠️ Communication Overhead</strong>: DataParallel synchronizes gradients and scatters/gathers data via the PCIe bus. For very fast single-GPU inference, this can introduce a small overhead. The benefit is most pronounced for large images or batches.
+        </div>
+        <div class="warning">
+            <strong>⚠️ Batch Size</strong>: To fully utilize parallel GPUs, increase your generation batch size. The batch is automatically split among the GPUs. A batch size of 5 on 5 GPUs would send one item per GPU.
+        </div>
+
+        <hr>
+
+        <h2>Further Reading & Resources</h2>
+        <p>For more general information about SD.Next features, configuration, and advanced usage, please refer to the official documentation:</p>
+        <p style="font-size: 1.2rem; text-align: center;">➡️ <strong><a href="https://vladmandic.github.io/sdnext-docs/" target="_blank">SD.Next Official Documentation</a></strong></p>
+        <p>Key sections that might be helpful after enabling multi-GPU:</p>
+        <ul>
+            <li><strong>Performance Tuning</strong>: Learn about other optimization options like <code>--medvram</code>, <code>--lowvram</code>, and compile settings: <a href="https://vladmandic.github.io/sdnext-docs/Performance/">Performance Tuning Guide</a></li>
+            <li><strong>Command Line Arguments</strong>: See all available startup options: <a href="https://vladmandic.github.io/sdnext-docs/Arguments/">CLI Arguments</a></li>
+            <li><strong>Model Quantization</strong>: Techniques to further reduce memory footprint: <a href="https://vladmandic.github.io/sdnext-docs/Quantization/">Quantization Guide</a></li>
+            <li><strong>Troubleshooting</strong>: If you encounter issues, check the <a href="https://vladmandic.github.io/sdnext-docs/FAQ/">FAQ</a> and <a href="https://vladmandic.github.io/sdnext-docs/Debug/">Debugging Guide</a>.</li>
+        </ul>
+
+        <div class="footer">
+            <p>© 2025 - Multi-GPU Parallel Processing for SD.Next. This document is part of a custom SD.Next fork.</p>
+        </div>
+    </div>
+</body>
+</html>

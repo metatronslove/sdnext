@@ -392,11 +392,19 @@ def webui(restart=False):
     load_model()
     try:
         if modules.devices.is_parallel_enabled() and shared.sd_model is not None:
-            modules.devices.parallelize_unet(shared.sd_model)
-            log.info("Model UNet/VAE paralel moda geçirildi")
+            # Sadece UNet'i paralel yap, VAE'yi sarma
+            if hasattr(shared.sd_model, 'model') and hasattr(shared.sd_model.model, 'diffusion_model'):
+                unet = shared.sd_model.model.diffusion_model
+                shared.sd_model.model.diffusion_model = modules.devices.parallelize_model(unet, "unet")
+                log.info(f"UNet {len(modules.devices.get_parallel_device_ids())} GPU'da paralel mod")
+            # VAE'yi sarma (isteğe bağlı, sorun çıkarırsa kapat)
+            if hasattr(shared.sd_model, 'vae'):
+                vae = shared.sd_model.vae
+                shared.sd_model.vae = modules.devices.parallelize_model(vae, "vae")
+                log.info(f"VAE {len(modules.devices.get_parallel_device_ids())} GPU'da paralel mod")
     except Exception as e:
         log.debug(f"Model paralelleştirme hatası: {e}")
-    
+        
     mount_subpath(app)
     shared.opts.save()
 

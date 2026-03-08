@@ -742,38 +742,52 @@ def parallelize_model(model, model_name="default", device_ids=None):
         model_name: Model için benzersiz isim
         device_ids: Kullanılacak GPU ID'leri
     Returns:
-        DataParallel ile sarılmış model
+        DataParallel ile sarılmış model (device attribute'u eklenmiş)
     """
     global _parallel_models
-    
+
     if not _parallel_enabled:
         return model.to(get_optimal_device())
-    
+
     if device_ids is None:
         device_ids = _parallel_device_ids
-    
+
     if len(device_ids) <= 1:
         log.debug(f"Model {model_name}: {len(device_ids)} GPU, paralel mod atlandı")
         return model.to(f"cuda:{device_ids[0]}")
-    
+
     try:
-        from torch.nn import DataParallel
-        
+        # DataParallel'in device attribute'u olmadığı için özel bir sınıf tanımlıyoruz
+        class DataParallelWithDevice(torch.nn.DataParallel):
+            @property
+            def device(self):
+                # İlk cihazı döndür (DataParallel'in ana cihazı)
+                if self.device_ids:
+                    return torch.device(f"cuda:{self.device_ids[0]}")
+                return None
+
+            def __getattr__(self, name):
+                # Eksik öznitelikleri asıl modüle yönlendir
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
         # Modeli ana GPU'ya taşı
         main_device = f"cuda:{device_ids[0]}"
         model = model.to(main_device)
-        
-        # DataParallel ile sar
-        parallel_model = DataParallel(
-            model, 
+
+        # DataParallelWithDevice ile sar
+        parallel_model = DataParallelWithDevice(
+            model,
             device_ids=device_ids,
             output_device=device_ids[0]
         )
-        
+
         _parallel_models[model_name] = parallel_model
         log.debug(f"Model {model_name}: {len(device_ids)} GPU'da paralel mod")
         return parallel_model
-        
+
     except Exception as e:
         log.error(f"Model paralelleştirilemedi: {e}")
         return model.to(f"cuda:{device_ids[0]}")

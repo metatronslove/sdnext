@@ -658,3 +658,176 @@ def same_device(d1, d2):
     if torch.device(d1).type != torch.device(d2).type:
         return False
     return normalize_device(d1) == normalize_device(d2)
+
+
+# ==================== 5 GPU PARALEL KULLANIM EKLEMELERİ ====================
+# Bu eklemeler mevcut fonksiyonların girdi/çıktılarını değiştirmez
+# Sadece yeni fonksiyonlar ekler ve mevcut fonksiyonları genişletir
+
+_parallel_enabled = False
+_parallel_device_ids = []
+_parallel_models = {}  # {model_adı: parallel_model}
+
+def get_device_count():
+    """Kullanılabilir GPU sayısını döndürür"""
+    if cuda_ok:
+        return torch.cuda.device_count()
+    return 0
+
+def get_parallel_device_ids():
+    """Paralel kullanılan GPU ID'lerini döndürür"""
+    return _parallel_device_ids.copy()
+
+def is_parallel_enabled():
+    """Paralel mod aktif mi?"""
+    return _parallel_enabled
+
+def enable_parallel_gpus(device_ids=None):
+    """
+    Tüm GPU'ları paralel kullanım için aktifleştir
+    Args:
+        device_ids: Kullanılacak GPU ID'leri listesi (None = tümü)
+    Returns:
+        bool: Başarılı ise True
+    """
+    global _parallel_enabled, _parallel_device_ids
+    
+    if not cuda_ok:
+        log.warning("Paralel GPU: CUDA bulunamadı, devre dışı")
+        return False
+    
+    available = list(range(torch.cuda.device_count()))
+    if len(available) == 0:
+        log.warning("Paralel GPU: Kullanılabilir GPU yok")
+        return False
+    
+    if device_ids is None:
+        _parallel_device_ids = available
+    else:
+        _parallel_device_ids = [i for i in device_ids if i in available]
+    
+    if len(_parallel_device_ids) < 2:
+        log.info(f"Paralel GPU: {len(_parallel_device_ids)} GPU tespit edildi, tek GPU modunda çalışılacak")
+        _parallel_enabled = False
+        return False
+    
+    # GPU'ları hazırla
+    total_memory = 0
+    for i in _parallel_device_ids:
+        with torch.cuda.device(i):
+            torch.cuda.empty_cache()
+            props = torch.cuda.get_device_properties(i)
+            memory_gb = props.total_memory / 1e9
+            total_memory += memory_gb
+            log.info(f"  GPU {i}: {props.name}, {memory_gb:.2f} GB")
+    
+    _parallel_enabled = True
+    log.info(f"✅ {len(_parallel_device_ids)} GPU paralel mod aktif! Toplam VRAM: {total_memory:.2f} GB")
+    return True
+
+def disable_parallel_gpus():
+    """Paralel GPU kullanımını devre dışı bırak"""
+    global _parallel_enabled, _parallel_device_ids, _parallel_models
+    _parallel_enabled = False
+    _parallel_device_ids = []
+    _parallel_models = {}
+    torch_gc(force=True)
+    log.info("Paralel GPU modu devre dışı")
+
+def parallelize_model(model, model_name="default", device_ids=None):
+    """
+    Modeli DataParallel ile sararak tüm GPU'larda paralel çalıştır
+    Args:
+        model: torch.nn.Module
+        model_name: Model için benzersiz isim
+        device_ids: Kullanılacak GPU ID'leri
+    Returns:
+        DataParallel ile sarılmış model
+    """
+    global _parallel_models
+    
+    if not _parallel_enabled:
+        return model.to(get_optimal_device())
+    
+    if device_ids is None:
+        device_ids = _parallel_device_ids
+    
+    if len(device_ids) <= 1:
+        log.debug(f"Model {model_name}: {len(device_ids)} GPU, paralel mod atlandı")
+        return model.to(f"cuda:{device_ids[0]}")
+    
+    try:
+        from torch.nn import DataParallel
+        
+        # Modeli ana GPU'ya taşı
+        main_device = f"cuda:{device_ids[0]}"
+        model = model.to(main_device)
+        
+        # DataParallel ile sar
+        parallel_model = DataParallel(
+            model, 
+            device_ids=device_ids,
+            output_device=device_ids[0]
+        )
+        
+        _parallel_models[model_name] = parallel_model
+        log.debug(f"Model {model_name}: {len(device_ids)} GPU'da paralel mod")
+        return parallel_model
+        
+    except Exception as e:
+        log.error(f"Model paralelleştirilemedi: {e}")
+        return model.to(f"cuda:{device_ids[0]}")
+
+def parallelize_unet(sd_model):
+    """SD modelindeki UNet'i paralel hale getir"""
+    if not _parallel_enabled or sd_model is None:
+        return sd_model
+    
+    if hasattr(sd_model, 'model') and hasattr(sd_model.model, 'diffusion_model'):
+        unet = sd_model.model.diffusion_model
+        sd_model.model.diffusion_model = parallelize_model(unet, "unet")
+        log.info(f"UNet {len(_parallel_device_ids)} GPU'da paralel mod")
+    
+    if hasattr(sd_model, 'vae'):
+        vae = sd_model.vae
+        sd_model.vae = parallelize_model(vae, "vae")
+        log.info(f"VAE {len(_parallel_device_ids)} GPU'da paralel mod")
+    
+    return sd_model
+
+def parallel_inference(model, *args, **kwargs):
+    """Paralel model ile çıkarım yap"""
+    if isinstance(model, torch.nn.DataParallel):
+        return model(*args, **kwargs)
+    return model(*args, **kwargs)
+
+# Orijinal torch_gc'yi tüm GPU'larda temizlik yapacak şekilde genişlet
+_original_torch_gc = torch_gc
+
+def torch_gc_parallel(force=False, fast=False, reason=None):
+    """Orijinal torch_gc + tüm paralel GPU'larda temizlik"""
+    result = _original_torch_gc(force, fast, reason)
+    
+    if _parallel_enabled and cuda_ok:
+        for device_id in _parallel_device_ids:
+            try:
+                with torch.cuda.device(device_id):
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    return result
+
+# Orijinal fonksiyonu yenisiyle değiştir (aynı imza)
+torch_gc = torch_gc_parallel
+
+# Orijinal autocast'i paralel mod için genişlet
+_original_autocast = autocast
+
+def autocast_parallel(disable=False):
+    """Paralel modda autocast"""
+    if _parallel_enabled and not disable and cuda_ok:
+        return torch.autocast("cuda")
+    return _original_autocast(disable)
+
+autocast = autocast_parallel
